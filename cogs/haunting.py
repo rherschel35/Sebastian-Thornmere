@@ -8,6 +8,10 @@ Passive presence: Sebastian noticing things without being asked - rarely.
   his passion shows.
 - Otherwise, very rarely, he chimes in unasked - and only if a good pun
   fits. If none does, he stays silent.
+- His own house, Thornmere, is the exception: with Thornmere students he's
+  warm and talkative - longer answers when called on, and now and then he
+  joins their conversation unasked (at most once per channel every few
+  minutes).
 - Remembering what members say, condensing it into running notes.
 
 Sebastian does not talk to the other ghosts. He ignores every bot entirely.
@@ -18,6 +22,7 @@ import logging
 import os
 import random
 import re
+import time
 
 import discord
 from discord.ext import commands
@@ -29,6 +34,25 @@ log = logging.getLogger("thornmere.haunting")
 # How often he considers chiming in, unasked, with a pun. Most of the time
 # the model then decides nothing's good enough and he stays silent.
 PUN_CHANCE = 0.03
+
+# His own house. Thornmere students get a warmer, more talkative Sebastian:
+# he answers them at more length, and now and then joins their conversation
+# unasked. Matched by role ID (override with HOUSE_ROLE_ID), falling back to
+# a role named exactly "Thornmere".
+HOUSE_ROLE_ID = int(os.getenv("HOUSE_ROLE_ID", "1550167097622134784") or 0)
+HOUSE_ROLE_NAME = "thornmere"
+# Chance he joins in, unasked, when a housemate says something (he can still
+# decide he has nothing to add). At most once per channel per cooldown.
+HOUSE_CHIME_CHANCE = float(os.getenv("HOUSE_CHIME_CHANCE", "0.15"))
+HOUSE_CHIME_COOLDOWN = int(os.getenv("HOUSE_CHIME_COOLDOWN_SECONDS", "300"))
+
+
+def is_housemate(member) -> bool:
+    """True if this member has the Thornmere house role."""
+    for role in getattr(member, "roles", None) or []:
+        if role.id == HOUSE_ROLE_ID or (role.name or "").strip().lower() == HOUSE_ROLE_NAME:
+            return True
+    return False
 
 
 def _parse_channel_ids(env_value: str | None):
@@ -55,6 +79,20 @@ TOURNAMENT_CUE = (
     "vivid, proud, full of what makes it work and why it matters. Three or four sentences."
 )
 
+# Called on by one of his own house: much less shy.
+HOUSE_NAME_CUE = (
+    "One of your own Thornmere students said your name. With them you're at ease - warm, glad they "
+    "called, and happy to talk. Answer in two or three sentences, and feel free to ask them something back."
+)
+
+# Joining a housemate's conversation, unasked.
+HOUSE_CHIME_CUE = (
+    "One of your own Thornmere students just said this, not to you: \"{content}\". You like them and you're "
+    "comfortable around them, so you might join in - a warm comment, a little encouragement, a small hint if "
+    "they're stuck, a question about what they're up to, or a pun if a good one fits. One or two sentences. "
+    "If you genuinely have nothing worth adding, reply with exactly SKIP."
+)
+
 _NAME_PATTERN = re.compile(r"\bsebastian\b", re.IGNORECASE)
 _TOURNAMENT_PATTERN = re.compile(r"\b(tri[- ]?wizard|tournament)s?\b", re.IGNORECASE)
 
@@ -63,14 +101,17 @@ def is_tournament_talk(content: str) -> bool:
     return bool(_TOURNAMENT_PATTERN.search(content or ""))
 
 
-def match_keyword(content: str, rng=random):
+def match_keyword(content: str, rng=random, housemate: bool = False):
     """His name is his only trigger. Returns (keyword, cue) or (None, None).
-    Called on while the talk is about the tournament, he answers with passion."""
+    Called on while the talk is about the tournament, he answers with passion.
+    Called on by a housemate, he's warm and talkative instead of shy."""
     text = (content or "").replace("\u2019", "'")
     if not _NAME_PATTERN.search(text):
         return None, None
     if is_tournament_talk(text):
         return "tournament", TOURNAMENT_CUE
+    if housemate:
+        return "house", HOUSE_NAME_CUE
     return "sebastian", NAME_CUE
 
 
@@ -78,6 +119,10 @@ class Haunting(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.allowed_channel_ids = _parse_channel_ids(os.getenv("HAUNT_CHANNEL_IDS"))
+        self._last_house_chime = {}  # channel_id -> timestamp of his last unasked housemate chime
+
+    def _house_chime_ready(self, channel_id: int) -> bool:
+        return time.time() - self._last_house_chime.get(channel_id, 0) >= HOUSE_CHIME_COOLDOWN
 
     async def _write_notes_safely(self, personality):
         try:
@@ -134,7 +179,16 @@ class Haunting(commands.Cog):
             else:
                 history.append({"role": "user", "content": f"{msg.author.display_name}: {text}"})
 
-        if replying_to_me:
+        housemate = is_housemate(message.author)
+        if housemate:
+            direction = (
+                "One of your own Thornmere students is talking to you directly - the last message above. "
+                "With your own house you're at ease: warm, glad they came to you, and happy to talk. Answer "
+                "in two or three sentences, carry on naturally from anything you said before, and feel free "
+                "to ask them something back. Everything above is a real exchange you were part of - never say "
+                "you don't remember it or break character. If it's about the tournament, your passion takes over."
+            )
+        elif replying_to_me:
             direction = (
                 "Someone has just replied directly to something you said, and their reply is the last "
                 "message above. Answer them, in character, carrying on naturally from your own last "
@@ -150,6 +204,8 @@ class Haunting(commands.Cog):
                 "the shyness falls away and your passion shows."
             )
 
+        if housemate:
+            author_name += " (a Thornmere student - your house)"
         async with message.channel.typing():
             line = await personality.speak(
                 f"{author_name}: {asked}", max_tokens=260, history=history, direction=direction,
@@ -184,11 +240,17 @@ class Haunting(commands.Cog):
         if await self._maybe_answer_direct_address(message, personality):
             return
 
-        keyword, matched_cue = match_keyword(content)
+        housemate = is_housemate(message.author)
+        keyword, matched_cue = match_keyword(content, housemate=housemate)
 
         cue = None
         if matched_cue:
-            cue = f'{matched_cue} They said: "{content}"'
+            speaker = f"{author_name}, a Thornmere student," if housemate else "They"
+            cue = f'{matched_cue} {speaker} said: "{content}"'
+        elif housemate and len(content.strip()) >= 12 and self._house_chime_ready(message.channel.id) \
+                and random.random() < HOUSE_CHIME_CHANCE:
+            self._last_house_chime[message.channel.id] = time.time()
+            cue = f"{author_name}: " + HOUSE_CHIME_CUE.format(content=content)
         elif len(content.strip()) >= 12 and random.random() < PUN_CHANCE:
             cue = (
                 f'Someone said: "{content}". You were not asked. Only if a genuinely good, silly pun on what '
@@ -199,10 +261,11 @@ class Haunting(commands.Cog):
             return
 
         if keyword:
-            # Called on by name: he always answers. Shy, or - for the
-            # tournament - with everything he's got.
+            # Called on by name: he always answers. Shy, warm for his own
+            # house, or - for the tournament - with everything he's got.
+            tokens = {"tournament": 260, "house": 200}.get(keyword, 120)
             async with message.channel.typing():
-                line = await personality.speak(cue, max_tokens=260 if keyword == "tournament" else 120)
+                line = await personality.speak(cue, max_tokens=tokens)
         else:
             line = await personality.speak(cue, max_tokens=120, allow_silence=True)
         if is_silence(line):
